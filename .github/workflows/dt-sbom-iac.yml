@@ -146,8 +146,12 @@ jobs:
           output: trivy-config.sarif
           exit-code: '0'
 
+      # SARIF upload requires GitHub Advanced Security on private repos.
+      # `continue-on-error: true` on ALL SARIF steps so DT ingestion still
+      # runs when a repo doesn't have GHAS enabled.
       - name: Upload Trivy SARIF to Code Scanning
-        if: always()
+        if: always() && hashFiles('trivy-config.sarif') != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3.37.3
         with:
           sarif_file: trivy-config.sarif
@@ -158,6 +162,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Checkov scan
         id: checkov
+        continue-on-error: true
         uses: bridgecrewio/checkov-action@v12.1347.0
         with:
           directory: ${{ inputs.scan-path }}
@@ -168,7 +173,8 @@ jobs:
           download_external_modules: true
 
       - name: Upload Checkov SARIF to Code Scanning
-        if: always()
+        if: always() && hashFiles('checkov-report/results_sarif.sarif') != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3.37.3
         with:
           sarif_file: checkov-report/results_sarif.sarif
@@ -187,6 +193,7 @@ jobs:
 
       - name: Upload tfsec SARIF to Code Scanning
         if: always() && hashFiles('tfsec.sarif') != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3.37.3
         with:
           sarif_file: tfsec.sarif
