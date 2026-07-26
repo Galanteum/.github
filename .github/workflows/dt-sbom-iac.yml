@@ -92,7 +92,7 @@ jobs:
           echo "value=$V" >> "$GITHUB_OUTPUT"
 
       - name: Vault JWT auth → DT_UPLOAD_KEY
-        uses: hashicorp/vault-action@v3
+        uses: hashicorp/vault-action@v4.0.0
         with:
           url: ${{ env.VAULT_ADDR }}
           method: jwt
@@ -128,7 +128,7 @@ jobs:
       #    Produces CycloneDX SBOM AND SARIF findings simultaneously
       # -----------------------------------------------------------------------
       - name: Trivy config scan → CycloneDX
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: ${{ inputs.scan-path }}
@@ -137,7 +137,7 @@ jobs:
           exit-code: '0'
 
       - name: Trivy config scan → SARIF (for Code Scanning tab)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: ${{ inputs.scan-path }}

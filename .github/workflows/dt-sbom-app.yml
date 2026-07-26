@@ -110,7 +110,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Vault JWT auth → DT_UPLOAD_KEY
         id: vault
-        uses: hashicorp/vault-action@v3
+        uses: hashicorp/vault-action@v4.0.0
         with:
           url: ${{ env.VAULT_ADDR }}
           method: jwt
@@ -147,7 +147,7 @@ jobs:
       # 5. LAYER 2 — syft (broad ecosystem, complementary to cdxgen)
       # -----------------------------------------------------------------------
       - name: Generate syft SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@v0.24.0
         with:
           path: .
           format: cyclonedx-json
@@ -164,7 +164,7 @@ jobs:
       # 6. LAYER 3 — trivy filesystem scan (SBOM + vulns cross-check)
       # -----------------------------------------------------------------------
       - name: Trivy filesystem SBOM
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
