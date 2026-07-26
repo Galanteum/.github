@@ -1,0 +1,247 @@
+# =============================================================================
+# Dependency-Track — Container Image SBOM Upload (reusable workflow)
+# =============================================================================
+# WHAT: For repos that build and publish OCI images. Scans the PUBLISHED
+#       image (not source) with trivy in image mode, producing a CycloneDX
+#       SBOM that captures the FINAL layered filesystem — base OS packages
+#       PLUS what your build actually copied/installed on top. Uploads to
+#       Dependency-Track under a project named `<project-name>-image` so it
+#       shows up separately from the source-code SBOM (dt-sbom-app.yml).
+#
+# WHY separate from dt-sbom-app.yml: source-code SBOM captures package.json /
+#       go.mod / etc. — the DECLARED deps. Image SBOM captures the actual
+#       runtime binaries + base image OS packages (Alpine/Debian CVEs the
+#       source code never sees). Both matter; DT tracks them as sibling
+#       projects sharing a parent so drill-down works.
+#
+# WHO: Called AFTER a successful docker build+push (or after any workflow
+#      that produces a pullable image ref). Pass `image` as `registry/name:tag`.
+#
+# AUTH: Same OIDC → Vault jwt-github/dt-sbom-uploader pattern as the app +
+#       IaC workflows.
+#
+# HOW TO CALL from a consuming repo (e.g. after docker-build.yml pushes):
+#   jobs:
+#     scan-image:
+#       needs: build
+#       uses: Galanteum/.github/.github/workflows/dt-sbom-image.yml@main
+#       with:
+#         project-name: my-app
+#         image: ghcr.io/myorg/my-app:${{ github.sha }}
+#         # Optional — private registry auth (leave empty for public images)
+#         registry-auth: |
+#           ghcr.io username=${{ github.actor }} password=${{ secrets.GHCR_TOKEN }}
+# =============================================================================
+name: DT SBOM Upload — Container Image (trivy image)
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        description: DT project name PREFIX (final name becomes "<name>-image")
+        required: true
+        type: string
+      image:
+        description: Full image reference (registry/name:tag) to scan
+        required: true
+        type: string
+      project-version:
+        description: DT project version tag (default = image tag suffix)
+        required: false
+        type: string
+        default: ""
+      parent-project:
+        description: Optional DT parent project name for grouping
+        required: false
+        type: string
+        default: ""
+      fail-on-critical:
+        description: Fail if DT reports any CRITICAL vuln post-analysis
+        required: false
+        type: boolean
+        default: false
+      registry-username:
+        description: Registry username (for private images; leave empty for public)
+        required: false
+        type: string
+        default: ""
+    secrets:
+      registry-password:
+        description: Registry password / token (matched with registry-username)
+        required: false
+
+env:
+  VAULT_ADDR: https://vault.mgmt.techsecom.io
+  DT_URL: https://dtrack.ops.techsecom.io
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      packages: read
+    steps:
+      - name: Compute project version from image tag
+        id: ver
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.project-version }}" ]]; then
+            V="${{ inputs.project-version }}"
+          else
+            # Extract tag suffix from image ref (e.g. "sha-abc123" or "1.2.3")
+            V="${{ inputs.image }}"
+            V="${V##*:}"
+            [[ -z "$V" ]] && V="latest"
+          fi
+          V=$(echo "$V" | tr '/' '_' | tr ' ' '_')
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+          echo "resolved project-version: $V"
+
+      # -----------------------------------------------------------------------
+      # 1. Vault JWT auth → DT_UPLOAD_KEY
+      # -----------------------------------------------------------------------
+      - name: Vault JWT auth → DT_UPLOAD_KEY
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: jwt
+          path: jwt-github
+          role: dt-sbom-uploader
+          jwtGithubAudience: https://vault.mgmt.techsecom.io
+          exportEnv: true
+          secrets: |
+            secret/data/downstream/deptrack/upload-key api-key | DT_UPLOAD_KEY
+
+      # -----------------------------------------------------------------------
+      # 2. Optional registry login (for private images)
+      # -----------------------------------------------------------------------
+      - name: Registry login
+        if: ${{ inputs.registry-username != '' }}
+        shell: bash
+        env:
+          RU: ${{ inputs.registry-username }}
+          RP: ${{ secrets.registry-password }}
+          IMG: ${{ inputs.image }}
+        run: |
+          REG="${IMG%%/*}"
+          # If image ref lacks explicit registry, default to Docker Hub
+          if [[ "$REG" != *.* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+          echo "  logging in to $REG as $RU"
+          echo "$RP" | docker login "$REG" -u "$RU" --password-stdin
+
+      # -----------------------------------------------------------------------
+      # 3. Pull the image so trivy scans it locally (avoids remote-scan quirks)
+      # -----------------------------------------------------------------------
+      - name: Pull image
+        shell: bash
+        run: |
+          docker pull "${{ inputs.image }}"
+          docker inspect "${{ inputs.image }}" --format '  size: {{.Size}} bytes'
+
+      # -----------------------------------------------------------------------
+      # 4. Trivy image scan → CycloneDX SBOM
+      #    Includes: OS packages (apt/apk/rpm), language packages, binaries
+      # -----------------------------------------------------------------------
+      - name: Trivy image → CycloneDX SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ inputs.image }}
+          format: cyclonedx
+          output: bom-image.json
+          exit-code: '0'
+          list-all-pkgs: true
+          scanners: vuln,secret,misconfig
+
+      - name: Trivy image → SARIF (for Code Scanning tab when GHAS available)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ inputs.image }}
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: '0'
+          scanners: vuln,secret,misconfig
+
+      - name: Upload Trivy SARIF to Code Scanning
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3.37.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: SBOM sanity check
+        shell: bash
+        run: |
+          [[ -s bom-image.json ]] || { echo "::error::trivy did not produce bom-image.json"; exit 1; }
+          python3 -c "import json; d=json.load(open('bom-image.json')); print(f'  components: {len(d.get(\"components\", []))}')"
+
+      # -----------------------------------------------------------------------
+      # 5. Upload to DT as <project-name>-image (sibling of source-code project)
+      # -----------------------------------------------------------------------
+      - name: Upload image SBOM to Dependency-Track
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project-name }}-image
+          PROJECT_VERSION: ${{ steps.ver.outputs.value }}
+          PARENT_PROJECT: ${{ inputs.parent-project }}
+          IMAGE_REF: ${{ inputs.image }}
+        run: |
+          echo "── Uploading image SBOM ($(wc -c <bom-image.json) bytes) as ${PROJECT_NAME}@${PROJECT_VERSION} ──"
+          args=(-sk -X POST -H "X-Api-Key: ${DT_UPLOAD_KEY}"
+                -F autoCreate=true
+                -F "projectName=${PROJECT_NAME}"
+                -F "projectVersion=${PROJECT_VERSION}"
+                -F "bom=@bom-image.json")
+          [[ -n "$PARENT_PROJECT" ]] && args+=(-F "parentName=${PARENT_PROJECT}")
+          resp=$(curl "${args[@]}" -w '\nHTTP:%{http_code}' "${DT_URL}/api/v1/bom")
+          echo "$resp"
+          echo "$resp" | grep -q "HTTP:2[0-9][0-9]" || { echo "::error::DT upload failed"; exit 1; }
+          echo ""
+          echo "Image scanned: ${IMAGE_REF}"
+          echo "View in DT:    ${DT_URL}/projects/?searchText=${PROJECT_NAME}"
+
+      # -----------------------------------------------------------------------
+      # 6. Optional gate: fail if DT reports Critical vulns in this image
+      # -----------------------------------------------------------------------
+      - name: Poll DT + fail on Critical
+        if: ${{ inputs.fail-on-critical }}
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project-name }}-image
+          PROJECT_VERSION: ${{ steps.ver.outputs.value }}
+        run: |
+          for i in {1..30}; do
+            sleep 10
+            proj_uuid=$(curl -sk -H "X-Api-Key: ${DT_UPLOAD_KEY}" \
+              "${DT_URL}/api/v1/project/lookup?name=${PROJECT_NAME}&version=${PROJECT_VERSION}" | \
+              python3 -c "import sys,json; print(json.load(sys.stdin).get('uuid',''))")
+            if [[ -n "$proj_uuid" ]]; then
+              metrics=$(curl -sk -H "X-Api-Key: ${DT_UPLOAD_KEY}" \
+                "${DT_URL}/api/v1/metrics/project/${proj_uuid}/current")
+              if [[ -n "$metrics" && "$metrics" != "null" ]]; then
+                critical=$(echo "$metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('critical',0))")
+                if [[ "$critical" -gt 0 ]]; then
+                  echo "::error::DT: $critical CRITICAL vulns in image ${PROJECT_NAME}@${PROJECT_VERSION}"
+                  exit 1
+                fi
+                echo "Image scan clean (critical=0)"
+                exit 0
+              fi
+            fi
+            echo "  poll $i/30"
+          done
+          echo "::warning::DT analysis timeout"
+
+      - name: Retain SBOM as artifact
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sbom-image-${{ inputs.project-name }}-${{ steps.ver.outputs.value }}
+          path: |
+            bom-image.json
+            trivy-image.sarif
+          retention-days: 7
+          if-no-files-found: warn
