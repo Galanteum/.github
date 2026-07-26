@@ -1,0 +1,259 @@
+# =============================================================================
+# Dependency-Track — Aggressive SBOM Upload (reusable workflow for APP repos)
+# =============================================================================
+# WHAT: Generates SBOMs using THREE independent tools (cdxgen, syft, trivy fs)
+#       and uploads each to Dependency-Track with autoCreate=true. DT dedupes
+#       components by purl across uploads for maximum coverage.
+#
+# WHO: Any repo in Galanteum/* or Techsecom/* can call this via workflow_call.
+#
+# AUTH: Zero long-lived secrets. Uses GitHub Actions OIDC token → Vault JWT
+#       (role: dt-sbom-uploader, mount: jwt-github) → reads DT API key from
+#       secret/downstream/deptrack/upload-key.
+#
+# COVERAGE:
+#   - cdxgen  → polyglot, deep (node/python/java/go/rust/etc), Terraform, Docker
+#   - syft    → broad ecosystem, complementary component surface
+#   - trivy   → filesystem scan, catches OS-level packages if any
+#
+# HOW TO CALL from a consuming repo (.github/workflows/sbom.yml):
+#   name: SBOM
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
+#     schedule:
+#       - cron: '0 3 * * 1'   # weekly Monday 03:00 UTC rescan of main
+#   permissions:
+#     id-token: write         # OIDC auth to Vault
+#     contents: read
+#   jobs:
+#     sbom:
+#       uses: Galanteum/.github/.github/workflows/dt-sbom-app.yml@main
+#       with:
+#         project-name: my-repo
+#         project-version: ${{ github.ref_name }}
+# =============================================================================
+name: DT SBOM Upload — App (cdxgen + syft + trivy)
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        description: DT project name (usually the repo name)
+        required: true
+        type: string
+      project-version:
+        description: DT project version tag (default = branch or short SHA)
+        required: false
+        type: string
+        default: ""
+      parent-project:
+        description: Optional DT parent project name (for grouping)
+        required: false
+        type: string
+        default: ""
+      fail-on-critical:
+        description: Fail the workflow if DT reports any CRITICAL vuln post-analysis
+        required: false
+        type: boolean
+        default: false
+      cdxgen-args:
+        description: Extra flags passed to cdxgen (e.g. --include-formulation)
+        required: false
+        type: string
+        default: "--include-formulation --spec-version 1.5"
+
+env:
+  VAULT_ADDR: https://vault.mgmt.techsecom.io
+  DT_URL: https://dtrack.ops.techsecom.io
+  # DT-recognized purl types. Do not touch unless you know why.
+  FETCH_LICENSE: "true"
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write         # required for OIDC auth to Vault
+      contents: read
+      security-events: write  # allows uploading SARIF (trivy) to Code Scanning
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout the caller repo at the ref that triggered the workflow
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # full history so cdxgen can attribute components
+
+      # -----------------------------------------------------------------------
+      # 2. Resolve the DT project version (default: short SHA or branch tag)
+      # -----------------------------------------------------------------------
+      - name: Compute project version
+        id: ver
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.project-version }}" ]]; then
+            V="${{ inputs.project-version }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME}"
+          else
+            V="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+          fi
+          # sanitize DT-illegal chars
+          V=$(echo "$V" | tr '/' '_' | tr ' ' '_')
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+          echo "resolved project-version: $V"
+
+      # -----------------------------------------------------------------------
+      # 3. Fetch DT API key from Vault via GitHub OIDC (no static secrets)
+      # -----------------------------------------------------------------------
+      - name: Vault JWT auth → DT_UPLOAD_KEY
+        id: vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: jwt
+          path: jwt-github
+          role: dt-sbom-uploader
+          exportEnv: true
+          secrets: |
+            secret/data/downstream/deptrack/upload-key api-key | DT_UPLOAD_KEY
+
+      # -----------------------------------------------------------------------
+      # 4. LAYER 1 — cdxgen (polyglot, deep, formulation-aware)
+      # -----------------------------------------------------------------------
+      - name: Setup Node (cdxgen prereq)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install cdxgen
+        run: |
+          npm install -g @cyclonedx/cdxgen@latest
+          cdxgen --version
+
+      - name: Generate cdxgen SBOM
+        env:
+          FETCH_LICENSE: "true"
+        run: |
+          mkdir -p .sbom
+          cdxgen -r -o .sbom/bom-cdxgen.json ${{ inputs.cdxgen-args }} .
+          echo "cdxgen SBOM: $(wc -c <.sbom/bom-cdxgen.json) bytes"
+          # sanity check
+          python3 -c "import json; d=json.load(open('.sbom/bom-cdxgen.json')); print(f'  components: {len(d.get(\"components\", []))}')"
+
+      # -----------------------------------------------------------------------
+      # 5. LAYER 2 — syft (broad ecosystem, complementary to cdxgen)
+      # -----------------------------------------------------------------------
+      - name: Generate syft SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: .sbom/bom-syft.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Syft SBOM sanity
+        run: |
+          [[ -f .sbom/bom-syft.json ]] && \
+            python3 -c "import json; d=json.load(open('.sbom/bom-syft.json')); print(f'  syft components: {len(d.get(\"components\", []))}')"
+
+      # -----------------------------------------------------------------------
+      # 6. LAYER 3 — trivy filesystem scan (SBOM + vulns cross-check)
+      # -----------------------------------------------------------------------
+      - name: Trivy filesystem SBOM
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: .sbom/bom-trivy.json
+          exit-code: '0'      # always succeed; DT is the gate
+          list-all-pkgs: true
+
+      - name: Trivy SBOM sanity
+        run: |
+          [[ -f .sbom/bom-trivy.json ]] && \
+            python3 -c "import json; d=json.load(open('.sbom/bom-trivy.json')); print(f'  trivy components: {len(d.get(\"components\", []))}')"
+
+      # -----------------------------------------------------------------------
+      # 7. Upload each SBOM to DT (autoCreate=true creates project if missing)
+      # -----------------------------------------------------------------------
+      - name: Upload SBOMs to Dependency-Track
+        env:
+          PROJECT_NAME: ${{ inputs.project-name }}
+          PROJECT_VERSION: ${{ steps.ver.outputs.value }}
+          PARENT_PROJECT: ${{ inputs.parent-project }}
+        run: |
+          upload() {
+            local bom_file="$1"
+            local tool="$2"
+            [[ ! -s "$bom_file" ]] && { echo "  SKIP $tool — SBOM missing/empty"; return; }
+            echo "── Uploading $tool SBOM ($(wc -c <"$bom_file") bytes) ──"
+            args=(
+              -sk
+              -X POST
+              -H "X-Api-Key: ${DT_UPLOAD_KEY}"
+              -F autoCreate=true
+              -F "projectName=${PROJECT_NAME}"
+              -F "projectVersion=${PROJECT_VERSION}"
+              -F "bom=@${bom_file}"
+            )
+            [[ -n "$PARENT_PROJECT" ]] && args+=(-F "parentName=${PARENT_PROJECT}")
+            response=$(curl "${args[@]}" -w '\nHTTP:%{http_code}' "${DT_URL}/api/v1/bom")
+            echo "$response"
+            echo "$response" | grep -q "HTTP:2[0-9][0-9]" || { echo "!! $tool UPLOAD FAILED"; return 1; }
+          }
+          set -e
+          upload .sbom/bom-cdxgen.json "cdxgen"
+          upload .sbom/bom-syft.json   "syft"
+          upload .sbom/bom-trivy.json  "trivy-fs"
+
+      # -----------------------------------------------------------------------
+      # 8. (Optional) Poll DT for scan completion + fail on Critical CVE
+      # -----------------------------------------------------------------------
+      - name: Poll DT scan & optionally fail on Critical
+        if: ${{ inputs.fail-on-critical }}
+        env:
+          PROJECT_NAME: ${{ inputs.project-name }}
+          PROJECT_VERSION: ${{ steps.ver.outputs.value }}
+        run: |
+          # Wait up to 5 min for DT to finish analyzing uploads
+          echo "Waiting for DT vulnerability analysis to complete..."
+          for i in {1..30}; do
+            sleep 10
+            # DT project lookup by name+version
+            proj_uuid=$(curl -sk -H "X-Api-Key: ${DT_UPLOAD_KEY}" \
+              "${DT_URL}/api/v1/project/lookup?name=${PROJECT_NAME}&version=${PROJECT_VERSION}" | \
+              python3 -c "import sys,json; print(json.load(sys.stdin).get('uuid',''))")
+            if [[ -n "$proj_uuid" ]]; then
+              metrics=$(curl -sk -H "X-Api-Key: ${DT_UPLOAD_KEY}" \
+                "${DT_URL}/api/v1/metrics/project/${proj_uuid}/current")
+              if [[ -n "$metrics" && "$metrics" != "null" ]]; then
+                echo "$metrics" | python3 -m json.tool
+                critical=$(echo "$metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('critical', 0))")
+                echo "CRITICAL count: $critical"
+                if [[ "$critical" -gt 0 ]]; then
+                  echo "::error::DT reports $critical CRITICAL vulnerabilities in ${PROJECT_NAME}@${PROJECT_VERSION}"
+                  exit 1
+                fi
+                exit 0
+              fi
+            fi
+            echo "  poll $i/30 — DT analysis still running..."
+          done
+          echo "::warning::DT analysis did not finish in 5 min; not failing (metrics unavailable yet)"
+
+      # -----------------------------------------------------------------------
+      # 9. Retain SBOMs as workflow artifacts (7-day retention, debug aid)
+      # -----------------------------------------------------------------------
+      - name: Upload SBOMs as workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms-${{ inputs.project-name }}-${{ steps.ver.outputs.value }}
+          path: .sbom/
+          retention-days: 7
+          if-no-files-found: warn

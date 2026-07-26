@@ -1,0 +1,264 @@
+# =============================================================================
+# Dependency-Track — IaC-focused SBOM Upload (reusable workflow)
+# =============================================================================
+# WHAT: For Terraform / Ansible / Kubernetes-manifest / Helm repos.
+#       Layers on top of dt-sbom-app.yml with IaC-specific scanners:
+#         * cdxgen        — provider/module deps from .terraform.lock.hcl
+#         * trivy config  — Terraform/Kubernetes misconfig detection
+#         * checkov       — deeper IaC policy violation scanner
+#         * tfsec         — Terraform-specific security scanner
+#
+# WHO: Any Techsecom/* or Galanteum/* repo whose primary content is IaC.
+#
+# AUTH: Same OIDC → Vault → dt-sbom-uploader-read pattern as the app workflow.
+#
+# HOW TO CALL from a consuming repo (.github/workflows/sbom.yml):
+#   name: SBOM (IaC)
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
+#     schedule:
+#       - cron: '0 3 * * 2'   # weekly Tuesday 03:00 UTC
+#   permissions:
+#     id-token: write
+#     contents: read
+#     security-events: write
+#   jobs:
+#     sbom:
+#       uses: Galanteum/.github/.github/workflows/dt-sbom-iac.yml@main
+#       with:
+#         project-name: my-iac-repo
+# =============================================================================
+name: DT SBOM Upload — IaC (cdxgen + checkov + tfsec + trivy config)
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        required: true
+        type: string
+      project-version:
+        required: false
+        type: string
+        default: ""
+      parent-project:
+        required: false
+        type: string
+        default: ""
+      fail-on-critical:
+        required: false
+        type: boolean
+        default: false
+      fail-on-iac-high:
+        description: Fail if checkov/tfsec/trivy-config report HIGH severity misconfig
+        required: false
+        type: boolean
+        default: false
+      scan-path:
+        description: Root path to scan (default . — override if repo has subdir focus)
+        required: false
+        type: string
+        default: "."
+
+env:
+  VAULT_ADDR: https://vault.mgmt.techsecom.io
+  DT_URL: https://dtrack.ops.techsecom.io
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute project version
+        id: ver
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.project-version }}" ]]; then
+            V="${{ inputs.project-version }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME}"
+          else
+            V="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+          fi
+          V=$(echo "$V" | tr '/' '_' | tr ' ' '_')
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Vault JWT auth → DT_UPLOAD_KEY
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: jwt
+          path: jwt-github
+          role: dt-sbom-uploader
+          exportEnv: true
+          secrets: |
+            secret/data/downstream/deptrack/upload-key api-key | DT_UPLOAD_KEY
+
+      # -----------------------------------------------------------------------
+      # 1. cdxgen — extract IaC provider/module dependencies as CycloneDX
+      # -----------------------------------------------------------------------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install cdxgen
+        run: |
+          npm install -g @cyclonedx/cdxgen@latest
+          cdxgen --version
+
+      - name: cdxgen SBOM (IaC deps)
+        env:
+          FETCH_LICENSE: "true"
+        run: |
+          mkdir -p .sbom
+          # cdxgen types include terraform + docker + kubernetes + helm
+          cdxgen -r -o .sbom/bom-cdxgen.json --spec-version 1.5 "${{ inputs.scan-path }}"
+          python3 -c "import json; d=json.load(open('.sbom/bom-cdxgen.json')); print(f'  cdxgen components: {len(d.get(\"components\", []))}')"
+
+      # -----------------------------------------------------------------------
+      # 2. Trivy config scan — Terraform/K8s/Docker misconfiguration detection
+      #    Produces CycloneDX SBOM AND SARIF findings simultaneously
+      # -----------------------------------------------------------------------
+      - name: Trivy config scan → CycloneDX
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.scan-path }}
+          format: cyclonedx
+          output: .sbom/bom-trivy-config.json
+          exit-code: '0'
+
+      - name: Trivy config scan → SARIF (for Code Scanning tab)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.scan-path }}
+          format: sarif
+          output: trivy-config.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+      # -----------------------------------------------------------------------
+      # 3. Checkov — deep IaC policy scanner (covers TF/CFN/K8s/Docker/Helm)
+      # -----------------------------------------------------------------------
+      - name: Checkov scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ inputs.scan-path }}
+          quiet: false
+          soft_fail: true                    # never fail the step; gating below
+          output_format: sarif,cli
+          output_file_path: checkov-report,checkov-cli
+          download_external_modules: true
+
+      - name: Upload Checkov SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-report/results_sarif.sarif
+          category: checkov
+
+      # -----------------------------------------------------------------------
+      # 4. tfsec — Terraform-specific, complementary rule coverage
+      # -----------------------------------------------------------------------
+      - name: tfsec scan
+        id: tfsec
+        uses: aquasecurity/tfsec-sarif-action@v0.1.4
+        continue-on-error: true
+        with:
+          working_directory: ${{ inputs.scan-path }}
+          sarif_file: tfsec.sarif
+
+      - name: Upload tfsec SARIF to Code Scanning
+        if: always() && hashFiles('tfsec.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec.sarif
+          category: tfsec
+
+      # -----------------------------------------------------------------------
+      # 5. Upload SBOMs (cdxgen + trivy config) to DT
+      # -----------------------------------------------------------------------
+      - name: Upload SBOMs to Dependency-Track
+        env:
+          PROJECT_NAME: ${{ inputs.project-name }}
+          PROJECT_VERSION: ${{ steps.ver.outputs.value }}
+          PARENT_PROJECT: ${{ inputs.parent-project }}
+        run: |
+          upload() {
+            local bom_file="$1"
+            local tool="$2"
+            [[ ! -s "$bom_file" ]] && { echo "  SKIP $tool"; return; }
+            echo "── Uploading $tool ($(wc -c <"$bom_file") bytes) ──"
+            args=(-sk -X POST -H "X-Api-Key: ${DT_UPLOAD_KEY}"
+                  -F autoCreate=true
+                  -F "projectName=${PROJECT_NAME}"
+                  -F "projectVersion=${PROJECT_VERSION}"
+                  -F "bom=@${bom_file}")
+            [[ -n "$PARENT_PROJECT" ]] && args+=(-F "parentName=${PARENT_PROJECT}")
+            resp=$(curl "${args[@]}" -w '\nHTTP:%{http_code}' "${DT_URL}/api/v1/bom")
+            echo "$resp"
+            echo "$resp" | grep -q "HTTP:2[0-9][0-9]" || { echo "!! $tool UPLOAD FAILED"; return 1; }
+          }
+          set -e
+          upload .sbom/bom-cdxgen.json       "cdxgen"
+          upload .sbom/bom-trivy-config.json "trivy-config"
+
+      # -----------------------------------------------------------------------
+      # 6. Optional: fail on Critical CVE (from DT analysis)
+      # -----------------------------------------------------------------------
+      - name: Poll DT + fail on Critical
+        if: ${{ inputs.fail-on-critical }}
+        env:
+          PROJECT_NAME: ${{ inputs.project-name }}
+          PROJECT_VERSION: ${{ steps.ver.outputs.value }}
+        run: |
+          for i in {1..30}; do
+            sleep 10
+            proj_uuid=$(curl -sk -H "X-Api-Key: ${DT_UPLOAD_KEY}" \
+              "${DT_URL}/api/v1/project/lookup?name=${PROJECT_NAME}&version=${PROJECT_VERSION}" | \
+              python3 -c "import sys,json; print(json.load(sys.stdin).get('uuid',''))")
+            if [[ -n "$proj_uuid" ]]; then
+              metrics=$(curl -sk -H "X-Api-Key: ${DT_UPLOAD_KEY}" \
+                "${DT_URL}/api/v1/metrics/project/${proj_uuid}/current")
+              if [[ -n "$metrics" && "$metrics" != "null" ]]; then
+                critical=$(echo "$metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('critical',0))")
+                if [[ "$critical" -gt 0 ]]; then
+                  echo "::error::DT: $critical CRITICAL vulns in ${PROJECT_NAME}@${PROJECT_VERSION}"
+                  exit 1
+                fi
+                echo "DT scan clean (critical=0)"
+                exit 0
+              fi
+            fi
+            echo "  poll $i/30"
+          done
+          echo "::warning::DT analysis timeout"
+
+      - name: Retain SBOMs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms-iac-${{ inputs.project-name }}-${{ steps.ver.outputs.value }}
+          path: |
+            .sbom/
+            checkov-report/
+            tfsec.sarif
+            trivy-config.sarif
+          retention-days: 7
+          if-no-files-found: warn
