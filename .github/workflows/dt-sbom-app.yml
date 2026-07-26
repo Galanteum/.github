@@ -110,12 +110,13 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Vault JWT auth → DT_UPLOAD_KEY
         id: vault
-        uses: hashicorp/vault-action@v4.0.0
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
         with:
           url: ${{ env.VAULT_ADDR }}
           method: jwt
           path: jwt-github
           role: dt-sbom-uploader
+          jwtGithubAudience: https://vault.mgmt.techsecom.io
           exportEnv: true
           secrets: |
             secret/data/downstream/deptrack/upload-key api-key | DT_UPLOAD_KEY
