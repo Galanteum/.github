@@ -134,18 +134,34 @@ jobs:
 
       # -----------------------------------------------------------------------
       # 3. Pull the image so trivy scans it locally (avoids remote-scan quirks)
+      #    Skip cleanly if the tag doesn't exist — happens when the upstream
+      #    docker-build workflow is path-filtered and produced no image for
+      #    this ref (e.g. a workflow-only PR that didn't touch app source).
       # -----------------------------------------------------------------------
-      - name: Pull image
+      - name: Pull image (skip cleanly if manifest missing)
+        id: pull
         shell: bash
+        env:
+          IMG: ${{ inputs.image }}
         run: |
-          docker pull "${{ inputs.image }}"
-          docker inspect "${{ inputs.image }}" --format '  size: {{.Size}} bytes'
+          if docker pull "$IMG" 2>&1 | tee /tmp/pull.log; then
+            docker inspect "$IMG" --format '  size: {{.Size}} bytes'
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          elif grep -qiE 'manifest unknown|not found|does not exist' /tmp/pull.log; then
+            echo "::warning::image $IMG not found in registry (likely path-filtered build produced no image) — skipping scan"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::docker pull failed for $IMG with unexpected error:"
+            cat /tmp/pull.log
+            exit 1
+          fi
 
       # -----------------------------------------------------------------------
       # 4. Trivy image scan → CycloneDX SBOM
       #    Includes: OS packages (apt/apk/rpm), language packages, binaries
       # -----------------------------------------------------------------------
       - name: Trivy image → CycloneDX SBOM
+        if: steps.pull.outputs.found == 'true'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ inputs.image }}
@@ -156,6 +172,7 @@ jobs:
           scanners: vuln,secret,misconfig
 
       - name: Trivy image → SARIF (for Code Scanning tab when GHAS available)
+        if: steps.pull.outputs.found == 'true'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ inputs.image }}
@@ -165,7 +182,7 @@ jobs:
           scanners: vuln,secret,misconfig
 
       - name: Upload Trivy SARIF to Code Scanning
-        if: always() && hashFiles('trivy-image.sarif') != ''
+        if: steps.pull.outputs.found == 'true' && hashFiles('trivy-image.sarif') != ''
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3.37.3
         with:
@@ -173,6 +190,7 @@ jobs:
           category: trivy-image
 
       - name: SBOM sanity check
+        if: steps.pull.outputs.found == 'true'
         shell: bash
         run: |
           [[ -s bom-image.json ]] || { echo "::error::trivy did not produce bom-image.json"; exit 1; }
@@ -182,6 +200,7 @@ jobs:
       # 5. Upload to DT as <project-name>-image (sibling of source-code project)
       # -----------------------------------------------------------------------
       - name: Upload image SBOM to Dependency-Track
+        if: steps.pull.outputs.found == 'true'
         shell: bash
         env:
           PROJECT_NAME: ${{ inputs.project-name }}-image
@@ -207,7 +226,7 @@ jobs:
       # 6. Optional gate: fail if DT reports Critical vulns in this image
       # -----------------------------------------------------------------------
       - name: Poll DT + fail on Critical
-        if: ${{ inputs.fail-on-critical }}
+        if: ${{ steps.pull.outputs.found == 'true' && inputs.fail-on-critical }}
         shell: bash
         env:
           PROJECT_NAME: ${{ inputs.project-name }}-image
