@@ -87,9 +87,12 @@ jobs:
   sbom:
     runs-on: ${{ inputs.runner }}
     permissions:
-      id-token: write
+      id-token: write         # OIDC → Vault
       contents: read
-      packages: read
+      packages: read          # pull the image from ghcr
+      security-events: write  # upload-sarif → Code Scanning (was missing → the
+                              # "Resource not accessible by integration" error)
+      actions: read           # codeql-action telemetry reads the workflow-run
     steps:
       - name: Compute project version from image tag
         id: ver
@@ -193,7 +196,7 @@ jobs:
       - name: Upload Trivy SARIF to Code Scanning
         if: steps.pull.outputs.found == 'true' && hashFiles('trivy-image.sarif') != ''
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3.37.3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
