@@ -63,6 +63,15 @@ on:
         required: false
         type: string
         default: "--include-formulation --spec-version 1.5"
+      runner:
+        description: |
+          Runner label. Default 'ubuntu-latest' (GitHub-hosted) preserves the
+          historical behavior. Override to a self-hosted label (e.g. a
+          ScaleSet name like 'gitops-k8s-runners') when the calling org has
+          lost or disabled access to GitHub-hosted runners.
+        required: false
+        type: string
+        default: "ubuntu-latest"
 
 env:
   VAULT_ADDR: https://vault.mgmt.techsecom.io
@@ -72,7 +81,7 @@ env:
 
 jobs:
   sbom:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       id-token: write         # required for OIDC auth to Vault
       contents: read
