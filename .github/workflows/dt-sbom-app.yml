@@ -65,13 +65,13 @@ on:
         default: "--include-formulation --spec-version 1.5"
       runner:
         description: |
-          Runner label. Default 'ubuntu-latest' (GitHub-hosted) preserves the
+          Runner label. Defaults to the org's self-hosted ARC scaleset 'techsecom-k8s-runners'
           historical behavior. Override to a self-hosted label (e.g. a
           ScaleSet name like 'gitops-k8s-runners') when the calling org has
           lost or disabled access to GitHub-hosted runners.
         required: false
         type: string
-        default: "ubuntu-latest"
+        default: "techsecom-k8s-runners"
 
 env:
   VAULT_ADDR: https://vault.mgmt.techsecom.io
