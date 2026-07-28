@@ -60,6 +60,19 @@ on:
         required: false
         type: string
         default: "."
+      runner:
+        description: |
+          Runner label. Default 'ubuntu-latest' (GitHub-hosted) preserves the
+          historical behavior. Override to a self-hosted label (e.g. a
+          ScaleSet name like 'gitops-k8s-runners') when the calling org has
+          lost or disabled access to GitHub-hosted runners — billing block,
+          egress policy, air-gapped environment. Named `runner` rather than
+          `runs-on` so it's safe to use unquoted in `${{ inputs.runner }}`
+          expressions (the GitHub Actions expression parser treats a hyphen
+          in an identifier as subtraction).
+        required: false
+        type: string
+        default: "ubuntu-latest"
 
 env:
   VAULT_ADDR: https://vault.mgmt.techsecom.io
@@ -67,7 +80,7 @@ env:
 
 jobs:
   sbom:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       id-token: write
       contents: read
