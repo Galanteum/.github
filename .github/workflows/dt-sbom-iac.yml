@@ -61,15 +61,22 @@ on:
         type: string
         default: "."
       runner:
+        # NOTE: neither the description string NOR the comment above it may
+        # contain a literal dollar-double-brace expression referencing
+        # `inputs.*` — GitHub Actions evaluates expressions in workflow YAML
+        # anywhere they appear, and `inputs.*` is not in scope while the
+        # inputs block itself is being parsed. Prior version failed to load
+        # with "Unrecognized named-value: 'inputs'" because the example in
+        # the description resolved against an uninitialised inputs table.
         description: |
           Runner label. Default 'ubuntu-latest' (GitHub-hosted) preserves the
           historical behavior. Override to a self-hosted label (e.g. a
           ScaleSet name like 'gitops-k8s-runners') when the calling org has
           lost or disabled access to GitHub-hosted runners — billing block,
-          egress policy, air-gapped environment. Named `runner` rather than
-          `runs-on` so it's safe to use unquoted in `${{ inputs.runner }}`
-          expressions (the GitHub Actions expression parser treats a hyphen
-          in an identifier as subtraction).
+          egress policy, air-gapped environment. Named `runner` (single word)
+          rather than `runs-on` because the expression parser treats `-`
+          inside identifiers as subtraction, so `inputs.runs-on` would be
+          evaluated as `inputs.runs` minus `on` and error out.
         required: false
         type: string
         default: "ubuntu-latest"
