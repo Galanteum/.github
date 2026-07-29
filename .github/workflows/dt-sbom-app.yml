@@ -1,9 +1,19 @@
 # =============================================================================
 # Dependency-Track — Aggressive SBOM Upload (reusable workflow for APP repos)
 # =============================================================================
-# WHAT: Generates SBOMs using THREE independent tools (cdxgen, syft, trivy fs)
-#       and uploads each to Dependency-Track with autoCreate=true. DT dedupes
-#       components by purl across uploads for maximum coverage.
+# WHAT: Generates SBOMs using THREE independent tools (cdxgen, syft, trivy fs),
+#       MERGES them into ONE CycloneDX document, and uploads it to
+#       Dependency-Track ONCE (autoCreate=true).
+#
+#       CRITICAL: DT's POST /api/v1/bom is authoritative-REPLACE per
+#       project+version — every upload DELETES any component not present in
+#       the BOM just posted. Uploading cdxgen, then syft, then trivy
+#       SEPARATELY therefore made each upload wipe the previous tool's
+#       components, and those deletions raced the in-flight vulnerability-
+#       analysis writes -> COMPONENTS_VULNERABILITIES_FK1 rollbacks -> zero
+#       vulns persisted (32,932 components but only 12 vuln links, 2026-07-29).
+#       Merge-then-upload-once is DT's recommended multi-tool pattern: one
+#       authoritative BOM = union of every tool's components, no delete, no race.
 #
 # WHO: Any repo in Galanteum/* or Techsecom/* can call this via workflow_call.
 #
@@ -189,37 +199,68 @@ jobs:
             python3 -c "import json; d=json.load(open('.sbom/bom-trivy.json')); print(f'  trivy components: {len(d.get(\"components\", []))}')"
 
       # -----------------------------------------------------------------------
-      # 7. Upload each SBOM to DT (autoCreate=true creates project if missing)
+      # 7a. Merge all tool BOMs into ONE CycloneDX document.
+      #     See header — separate per-tool uploads authoritative-replace each
+      #     other in DT and race the analysis. A single merged upload is the
+      #     fix. CycloneDX CLI performs a spec-correct flat merge (dedup by
+      #     bom-ref/purl, re-keys colliding refs, normalises spec versions).
       # -----------------------------------------------------------------------
-      - name: Upload SBOMs to Dependency-Track
+      - name: Install CycloneDX CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "${RUNNER_TEMP}/cyclonedx" \
+            https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.33.1/cyclonedx-linux-x64
+          chmod +x "${RUNNER_TEMP}/cyclonedx"
+          "${RUNNER_TEMP}/cyclonedx" --version
+
+      - name: Merge SBOMs
+        id: merge
+        run: |
+          set -euo pipefail
+          bom_inputs=()
+          for f in .sbom/bom-cdxgen.json .sbom/bom-syft.json .sbom/bom-trivy.json; do
+            [[ -s "$f" ]] && bom_inputs+=("$f")
+          done
+          if [[ ${#bom_inputs[@]} -eq 0 ]]; then
+            echo "::warning::No SBOMs were produced — nothing to upload"
+            echo "have_bom=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "── Merging ${#bom_inputs[@]} BOM(s): ${bom_inputs[*]} ──"
+          "${RUNNER_TEMP}/cyclonedx" merge \
+            --input-files "${bom_inputs[@]}" \
+            --input-format json \
+            --output-file .sbom/bom-merged.json \
+            --output-format json \
+            --output-version v1_5
+          python3 -c "import json; d=json.load(open('.sbom/bom-merged.json')); print(f'  merged components: {len(d.get(\"components\", []))}')"
+          echo "have_bom=true" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # 7b. Upload the single merged SBOM to DT (autoCreate=true if missing)
+      # -----------------------------------------------------------------------
+      - name: Upload merged SBOM to Dependency-Track
+        if: steps.merge.outputs.have_bom == 'true'
         env:
           PROJECT_NAME: ${{ inputs.project-name }}
           PROJECT_VERSION: ${{ steps.ver.outputs.value }}
           PARENT_PROJECT: ${{ inputs.parent-project }}
         run: |
-          upload() {
-            local bom_file="$1"
-            local tool="$2"
-            [[ ! -s "$bom_file" ]] && { echo "  SKIP $tool — SBOM missing/empty"; return; }
-            echo "── Uploading $tool SBOM ($(wc -c <"$bom_file") bytes) ──"
-            args=(
-              -sk
-              -X POST
-              -H "X-Api-Key: ${DT_UPLOAD_KEY}"
-              -F autoCreate=true
-              -F "projectName=${PROJECT_NAME}"
-              -F "projectVersion=${PROJECT_VERSION}"
-              -F "bom=@${bom_file}"
-            )
-            [[ -n "$PARENT_PROJECT" ]] && args+=(-F "parentName=${PARENT_PROJECT}")
-            response=$(curl "${args[@]}" -w '\nHTTP:%{http_code}' "${DT_URL}/api/v1/bom")
-            echo "$response"
-            echo "$response" | grep -q "HTTP:2[0-9][0-9]" || { echo "!! $tool UPLOAD FAILED"; return 1; }
-          }
           set -e
-          upload .sbom/bom-cdxgen.json "cdxgen"
-          upload .sbom/bom-syft.json   "syft"
-          upload .sbom/bom-trivy.json  "trivy-fs"
+          echo "── Uploading merged SBOM ($(wc -c <.sbom/bom-merged.json) bytes) ──"
+          args=(
+            -sk
+            -X POST
+            -H "X-Api-Key: ${DT_UPLOAD_KEY}"
+            -F autoCreate=true
+            -F "projectName=${PROJECT_NAME}"
+            -F "projectVersion=${PROJECT_VERSION}"
+            -F "bom=@.sbom/bom-merged.json"
+          )
+          [[ -n "$PARENT_PROJECT" ]] && args+=(-F "parentName=${PARENT_PROJECT}")
+          response=$(curl "${args[@]}" -w '\nHTTP:%{http_code}' "${DT_URL}/api/v1/bom")
+          echo "$response"
+          echo "$response" | grep -q "HTTP:2[0-9][0-9]" || { echo "!! merged SBOM UPLOAD FAILED"; exit 1; }
 
       # -----------------------------------------------------------------------
       # 8. (Optional) Poll DT for scan completion + fail on Critical CVE

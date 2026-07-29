@@ -220,9 +220,21 @@ jobs:
           category: tfsec
 
       # -----------------------------------------------------------------------
-      # 5. Upload SBOMs (cdxgen + trivy config) to DT
+      # 5. Upload the cdxgen SBOM to DT (single authoritative upload)
       # -----------------------------------------------------------------------
-      - name: Upload SBOMs to Dependency-Track
+      # cdxgen is the ONLY dependency SBOM for an IaC repo. The trivy-config
+      # BOM is intentionally NOT uploaded to DT:
+      #   * `trivy config` reports MISCONFIGURATIONS, not dependencies — its
+      #     CycloneDX output carries ~0 components.
+      #   * DT's POST /api/v1/bom is authoritative-REPLACE per project+version,
+      #     so uploading the (empty) trivy-config BOM after cdxgen made DT
+      #     DELETE every cdxgen component ("Deleting N components no longer part
+      #     of the project"), and those deletions raced the in-flight vuln
+      #     analysis -> COMPONENTS_VULNERABILITIES_FK1 rollbacks -> 0 vulns
+      #     persisted (observed 2026-07-29).
+      # trivy-config findings already reach the Code Scanning tab via the SARIF
+      # step above — that is their correct destination, not DT.
+      - name: Upload SBOM to Dependency-Track
         env:
           PROJECT_NAME: ${{ inputs.project-name }}
           PROJECT_VERSION: ${{ steps.ver.outputs.value }}
@@ -244,8 +256,7 @@ jobs:
             echo "$resp" | grep -q "HTTP:2[0-9][0-9]" || { echo "!! $tool UPLOAD FAILED"; return 1; }
           }
           set -e
-          upload .sbom/bom-cdxgen.json       "cdxgen"
-          upload .sbom/bom-trivy-config.json "trivy-config"
+          upload .sbom/bom-cdxgen.json "cdxgen"
 
       # -----------------------------------------------------------------------
       # 6. Optional: fail on Critical CVE (from DT analysis)
