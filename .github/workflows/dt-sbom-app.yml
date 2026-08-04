@@ -150,7 +150,18 @@ jobs:
 
       - name: Install cdxgen
         run: |
-          npm install -g @cyclonedx/cdxgen@latest
+          # PINNED, not @latest. This is the same supply-chain reasoning that
+          # made every third-party action here SHA-pinned: @latest is maximally
+          # mutable, so the tool generating our SBOM could change — or be
+          # repointed — between two runs of the same commit. It also made SBOM
+          # output non-reproducible, and put an unannounced tool upgrade in the
+          # path of every consuming repo's CI at once.
+          #
+          # Bump deliberately: check the changelog, then update the pin here.
+          # Dependabot cannot see a version inside a `run:` block, so this will
+          # NOT self-update — that is the trade, and it is the same one the
+          # SHA-pinned actions accept.
+          npm install -g @cyclonedx/cdxgen@12.8.2
           cdxgen --version
 
       - name: Generate cdxgen SBOM
