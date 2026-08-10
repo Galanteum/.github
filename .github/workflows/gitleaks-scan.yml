@@ -1,0 +1,101 @@
+# =============================================================================
+# Gitleaks secret scanning (reusable)
+# =============================================================================
+# Replaces GitHub Advanced Security secret-scanning push protection, which was
+# disabled org-wide on Techsecom 2026-08-10 to stop ~$48/mo of billing.
+#
+# This is DETECTION. It runs after the push, so a finding means the credential
+# is already in the remote's history and must be ROTATED -- deleting the file
+# does not unleak it. Prevention is the committed .githooks/pre-commit hook in
+# each repo, which blocks the commit before the secret ever exists.
+#
+# Caller example:
+#
+#   jobs:
+#     gitleaks:
+#       uses: Galanteum/.github/.github/workflows/gitleaks-scan.yml@main
+#       with:
+#         runner: gitops-k8s-runners
+#
+# Per-repo `paths-ignore` belongs in the CALLER's trigger, not here -- that is
+# what lets gitops-argocd keep skipping Argo Image-Updater auto-commits.
+# =============================================================================
+name: Gitleaks Scan
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        # Named `runner`, NOT `runs-on`: the expression parser treats `-` inside
+        # an identifier as subtraction, so `inputs.runs-on` evaluates as
+        # `inputs.runs` minus `on` and fails to load. Same convention as
+        # dt-sbom-iac.yml.
+        description: |
+          Runner label. Defaults to the org's self-hosted ARC scaleset. Techsecom
+          callers pass 'gitops-k8s-runners' -- that org is billing-blocked from
+          GitHub-hosted runners, and self-hosted keeps Actions cost at $0.
+        required: false
+        type: string
+        default: "techsecom-k8s-runners"
+      gitleaks-version:
+        description: |
+          Pinned CLI version. Never float this -- a moving tag would let a
+          malicious release execute in CI. 8.25.0+ is required: the default
+          ruleset we extend declares minVersion = 8.25.0, and the `[[allowlists]]`
+          array syntax used by repo configs does not parse cleanly before 8.21.
+        required: false
+        type: string
+        default: "8.28.0"
+      fetch-depth:
+        description: |
+          Checkout depth. 0 (full history) is the default and the safe value: a
+          secret added in an earlier commit of the branch is just as leaked as
+          one at the tip, and a shallow clone hides it.
+        required: false
+        type: number
+        default: 0
+
+jobs:
+  gitleaks:
+    name: Detect Secrets
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      # NO security-events: write. SARIF upload requires GitHub Advanced
+      # Security, which is disabled org-wide -- the upload step would fail.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      # gitleaks-action@v2 requires a paid gitleaks.io org licence. The CLI is
+      # Apache-2.0, so use it directly and skip the licence gate.
+      #
+      # K8s runners expose no sudo and no writable /usr/local/bin, so install
+      # into $RUNNER_TEMP/bin and prepend that to $GITHUB_PATH.
+      - name: Install Gitleaks CLI
+        env:
+          GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
+          chmod 0755 "$RUNNER_TEMP/bin/gitleaks"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/gitleaks" version
+
+      # `gitleaks git` scans history; `detect` is a deprecated alias for it.
+      # The repo's own .gitleaks.toml and .gitleaksignore are picked up
+      # automatically from the checkout root, so the CI gate and the local
+      # pre-commit hook share one ruleset and cannot drift.
+      #
+      # --redact keeps the secret value out of the Actions log, which would
+      # otherwise leak it a second time into somewhere far more readable.
+      - name: Run Gitleaks scan
+        run: |
+          gitleaks git . \
+            --redact \
+            --exit-code 1
