@@ -117,7 +117,15 @@ jobs:
           elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             V="${GITHUB_REF_NAME}"
           else
-            V="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+            # Branch pushes use the BRANCH NAME (stable), NOT <branch>-<sha>.
+            # A per-commit version minted a new DT project on every commit with no
+            # cleanup -> unbounded version sprawl (2,773 projects; gitops-argocd
+            # alone reached 1,110 from image-updater bot commits) -> DEPENDENCY-
+            # METRICS recalculation churn -> cnpg-cluster-w XID burn + dt-scan-
+            # exporter CPU throttling. One project per branch, updated in place,
+            # reflects the branch's CURRENT state (the sha lives in git + the
+            # lastBomImport timestamp).
+            V="${GITHUB_REF_NAME}"
           fi
           # sanitize DT-illegal chars
           V=$(echo "$V" | tr '/' '_' | tr ' ' '_')
