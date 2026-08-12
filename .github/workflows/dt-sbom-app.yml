@@ -88,6 +88,10 @@ env:
   DT_URL: https://dtrack.ops.techsecom.io
   # DT-recognized purl types. Do not touch unless you know why.
   FETCH_LICENSE: "true"
+  # Defined ONCE and used by both the cache key and the download URL below.
+  # If those two can drift, bumping only the URL serves the stale cached
+  # binary forever.
+  CYCLONEDX_CLI_VERSION: v0.33.1
 
 jobs:
   sbom:
@@ -252,12 +256,34 @@ jobs:
       #     fix. CycloneDX CLI performs a spec-correct flat merge (dedup by
       #     bom-ref/purl, re-keys colliding refs, normalises spec versions).
       # -----------------------------------------------------------------------
+      # The binary is immutable per release tag, so a cache hit is always the
+      # right bytes and most runs never touch github.com at all. This download
+      # broke main on 2026-08-12 with "curl: (56) Connection died, tried 5
+      # times before giving up" - the third runner-egress failure that day
+      # (syft's release download and fonts.gstatic.com were the others).
+      #
+      # Unlike the syft step above, this tool CANNOT degrade gracefully: the
+      # merge below depends on it, so continue-on-error would only move the
+      # failure downstream. Cache it, and make the remaining download retry.
+      - name: Cache CycloneDX CLI
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/cyclonedx
+          key: cyclonedx-cli-${{ env.CYCLONEDX_CLI_VERSION }}-linux-x64
+
       - name: Install CycloneDX CLI
         run: |
           set -euo pipefail
-          curl -sSfL -o "${RUNNER_TEMP}/cyclonedx" \
-            https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.33.1/cyclonedx-linux-x64
+          # Gate on the FILE, not on the cache-hit output: a restored-but-empty
+          # entry would otherwise be trusted and fail later at a much less
+          # obvious point (a merge error instead of a download error).
+          if [[ ! -s "${RUNNER_TEMP}/cyclonedx" ]]; then
+            curl -sSfL --retry 5 --retry-all-errors --retry-delay 3 \
+              --connect-timeout 20 -o "${RUNNER_TEMP}/cyclonedx" \
+              "https://github.com/CycloneDX/cyclonedx-cli/releases/download/${CYCLONEDX_CLI_VERSION}/cyclonedx-linux-x64"
+          fi
           chmod +x "${RUNNER_TEMP}/cyclonedx"
+          # Doubles as the cache-integrity check: a bad restore fails HERE.
           "${RUNNER_TEMP}/cyclonedx" --version
 
       - name: Merge SBOMs
