@@ -186,6 +186,20 @@ jobs:
       # 5. LAYER 2 — syft (broad ecosystem, complementary to cdxgen)
       # -----------------------------------------------------------------------
       - name: Generate syft SBOM
+        # NON-FATAL. This action downloads the syft binary from GitHub releases
+        # on EVERY run, so an egress blip fails the whole job — even though the
+        # merge step below is already built to survive a missing tool (it
+        # collects whichever .sbom/*.json exist and only bails when NONE do).
+        #
+        # Observed 2026-08-12 on galanteum main, twice on the same commit:
+        #   [error] received HTTP status=000 for
+        #           url='https://github.com/anchore/syft/releases/v1.42.3'
+        # cdxgen had already produced a valid 9.2 MB SBOM with 1973 components
+        # and the job failed anyway, blocking merges to main. A supplementary
+        # scanner being unreachable should degrade the SBOM, not gate the repo.
+        # The sanity step below makes the absence loud so a PERSISTENT syft
+        # outage is still visible rather than silently shrinking coverage.
+        continue-on-error: true
         uses: anchore/sbom-action@v0.24.0
         with:
           path: .
@@ -196,8 +210,15 @@ jobs:
 
       - name: Syft SBOM sanity
         run: |
-          [[ -f .sbom/bom-syft.json ]] && \
+          # `[[ -f X ]] && cmd` was the whole step, and steps run under bash -e:
+          # when the file is absent the && list returns 1 and the STEP fails. So
+          # marking the action above non-fatal alone would just move the failure
+          # one step later. Branch explicitly instead.
+          if [[ -f .sbom/bom-syft.json ]]; then
             python3 -c "import json; d=json.load(open('.sbom/bom-syft.json')); print(f'  syft components: {len(d.get(\"components\", []))}')"
+          else
+            echo "::warning::syft SBOM missing — this upload carries NO syft layer (cdxgen/trivy still merge). Usually the action's syft download failed, not the caller's code."
+          fi
 
       # -----------------------------------------------------------------------
       # 6. LAYER 3 — trivy filesystem scan (SBOM + vulns cross-check)
