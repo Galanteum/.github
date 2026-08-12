@@ -92,6 +92,9 @@ env:
   # If those two can drift, bumping only the URL serves the stale cached
   # binary forever.
   CYCLONEDX_CLI_VERSION: v0.33.1
+  # Same single-source rule as above: the cache key and the install must not be
+  # able to drift, or bumping one serves the other's stale artefact.
+  CDXGEN_VERSION: 12.8.2
 
 jobs:
   sbom:
@@ -160,6 +163,24 @@ jobs:
         with:
           node-version: '20'
 
+      # npm's cache is content-addressable, so a hit lets the install resolve the
+      # tarball WITHOUT reaching the registry. Same exposure as the CycloneDX
+      # CLI download further down — a runtime fetch sitting in the critical path
+      # — and the same class of failure that broke a consumer's main on
+      # 2026-08-12 (curl 56 on a release download; syft and fonts.gstatic.com
+      # failed the same way that day).
+      #
+      # restore-keys deliberately falls back to any earlier cdxgen cache: npm
+      # content-addresses by integrity hash, so a partial reuse across versions
+      # is safe and still saves most of the transfer.
+      - name: Cache npm downloads (cdxgen)
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.npm
+          key: npm-cdxgen-${{ env.CDXGEN_VERSION }}
+          restore-keys: |
+            npm-cdxgen-
+
       - name: Install cdxgen
         run: |
           # PINNED, not @latest. This is the same supply-chain reasoning that
@@ -173,7 +194,9 @@ jobs:
           # Dependabot cannot see a version inside a `run:` block, so this will
           # NOT self-update — that is the trade, and it is the same one the
           # SHA-pinned actions accept.
-          npm install -g @cyclonedx/cdxgen@12.8.2
+          npm install -g --prefer-offline --no-audit --no-fund \
+            --fetch-retries=5 --fetch-retry-maxtimeout=60000 \
+            "@cyclonedx/cdxgen@${CDXGEN_VERSION}"
           cdxgen --version
 
       - name: Generate cdxgen SBOM
