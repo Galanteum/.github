@@ -116,6 +116,14 @@ jobs:
             # lastBomImport timestamp).
             V="${GITHUB_REF_NAME}"
           fi
+          # PR / merge-queue runs resolve GITHUB_REF_NAME to "<PR#>/merge" -> a NEW DT
+          # project version PER PR (43/day observed -> version sprawl -> cnpg-cluster-w
+          # WAL/XID churn + Ceph/MinIO quota pressure on the daily version-cleanup).
+          # Collapse them to ONE rolling "pr" version; only branch pushes + tags mint
+          # stable per-branch versions.
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" || "${GITHUB_EVENT_NAME}" == "merge_group" || "$V" == *"/merge" || "$V" == gh-readonly-queue/* ]]; then
+            V="pr"
+          fi
           V=$(echo "$V" | tr '/' '_' | tr ' ' '_')
           echo "value=$V" >> "$GITHUB_OUTPUT"
 
