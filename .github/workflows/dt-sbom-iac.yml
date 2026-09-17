@@ -161,14 +161,88 @@ jobs:
           python3 -c "import json; d=json.load(open('.sbom/bom-cdxgen.json')); print(f'  cdxgen components: {len(d.get(\"components\", []))}')"
 
       # -----------------------------------------------------------------------
+      # 1b. Vendor Helm chart dependencies so trivy can RENDER the charts
+      # -----------------------------------------------------------------------
+      # `trivy config` renders each Helm chart to scan the objects it produces.
+      # A chart whose dependencies are not committed under charts/ cannot be
+      # rendered, so trivy SKIPS it — and a skipped chart is reported identically
+      # to a clean one. In gitops-argocd that silently hid 19 charts; measured in
+      # a scratch copy, `helm dependency build` unlocked 18 of them and they held
+      # 634 further misconfigurations INCLUDING 40 CRITICAL and 94 HIGH.
+      #
+      # Deliberately best-effort: `continue-on-error` plus a tolerant loop, so a
+      # chart whose repo is unreachable degrades to "skipped by trivy", exactly
+      # the behaviour we have today, rather than failing the whole SBOM job.
+      # Repos are derived from each Chart.yaml rather than hardcoded, so this
+      # needs no maintenance as consumers add charts.
+      - name: Setup Helm
+        uses: azure/setup-helm@v5.0.1
+
+      - name: Vendor Helm chart dependencies (best effort)
+        continue-on-error: true
+        run: |
+          python3 - "${{ inputs.scan-path }}" <<'PY'
+          import glob, os, re, subprocess, sys
+          root = sys.argv[1] if len(sys.argv) > 1 else "."
+          charts = [c for c in glob.glob(f"{root}/**/Chart.yaml", recursive=True)
+                    if "/charts/" not in c]
+          # Collect every http(s) chart repository the tree references and add it
+          # once. OCI repositories need no `helm repo add`.
+          repos = {}
+          for cf in charts:
+              try:
+                  txt = open(cf).read()
+              except OSError:
+                  continue
+              for url in re.findall(r'repository:\s*"?(https?://[^"\s]+)"?', txt):
+                  repos.setdefault(url.rstrip("/"),
+                                   "r" + re.sub(r'[^a-z0-9]+', '-', url.lower())[:40].strip("-"))
+          print(f"chart repos referenced: {len(repos)}")
+          for url, alias in repos.items():
+              subprocess.run(["helm", "repo", "add", alias, url],
+                             capture_output=True, text=True)
+          subprocess.run(["helm", "repo", "update"], capture_output=True, text=True)
+          ok = skipped = 0
+          for cf in sorted(charts):
+              d = os.path.dirname(cf)
+              if not re.search(r'^dependencies:', open(cf).read(), re.M):
+                  continue
+              r = subprocess.run(["helm", "dependency", "build", "--skip-refresh", "."],
+                                 cwd=d, capture_output=True, text=True)
+              if r.returncode != 0:
+                  r = subprocess.run(["helm", "dependency", "update", "."],
+                                     cwd=d, capture_output=True, text=True)
+              if r.returncode == 0:
+                  ok += 1
+              else:
+                  skipped += 1
+                  first = (r.stderr or "").strip().split("\n")[0][:120]
+                  print(f"  could not vendor {os.path.relpath(d, root)}: {first}")
+          print(f"vendored: {ok}   still missing (trivy will skip these): {skipped}")
+          PY
+
+      # -----------------------------------------------------------------------
       # 2. Trivy config scan — Terraform/K8s/Docker misconfiguration detection
       #    Produces CycloneDX SBOM AND SARIF findings simultaneously
       # -----------------------------------------------------------------------
+      # `version` pins the trivy BINARY. trivy-action v0.36.0 is the newest
+      # action release but still defaults to trivy v0.70.0, which logs a chart it
+      # cannot render as
+      #     ERROR [helm scanner] Failed to render Chart files
+      # Between v0.70.0 and v0.74.0 upstream reclassified that to
+      #     WARN  [helm scanner] Skipping chart
+      # because a chart that needs values it was not given is not an error. Most
+      # of the "errors" on a gitops repo's build are exactly that: charts whose
+      # own `fail` guards correctly refuse to render without their ApplicationSet
+      # parameters. Pinning v0.74.0 stops those lines reading as failures, and
+      # leaves genuine ERRORs (unparseable files, broken rego) visible instead of
+      # buried. `exit-code: '0'` is unchanged — this alters log severity only.
       - name: Trivy config scan → CycloneDX
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: ${{ inputs.scan-path }}
+          version: v0.74.0
           format: cyclonedx
           output: .sbom/bom-trivy-config.json
           exit-code: '0'
@@ -178,6 +252,7 @@ jobs:
         with:
           scan-type: config
           scan-ref: ${{ inputs.scan-path }}
+          version: v0.74.0
           format: sarif
           output: trivy-config.sarif
           exit-code: '0'
